@@ -35,21 +35,6 @@ def split(infilename, num_chunks=multiprocessing.cpu_count()):
     return files
 
 
-def process_one_file(infile, outfile, function):
-    """Apply function to each line of infile and write result to outfile"""
-    reader = csv.DictReader(infile)
-    fake_row = {fieldname: 0 for fieldname in reader.fieldnames}
-    function(fake_row)
-    outkeys = fake_row.keys()
-    sorted_outkeys = [x for x in reader.fieldnames if x in outkeys]
-    sorted_outkeys += [x for x in outkeys if x not in reader.fieldnames]
-    writer = csv.DictWriter(outfile, sorted_outkeys)
-    writer.writeheader()
-    for row in reader:
-        function(row)
-        writer.writerow(row)
-
-
 def identity(row):
     """Useful identity function"""
     return row
@@ -60,22 +45,22 @@ def add_a_column(row):
     row["new_column"] = "default_value"
 
 
-class CSVProcessor(multiprocessing.Process):
-    """CSV processing helper process"""
-
-    def __init__(self, infile, proc_num, results_queue, function):
-        """Initialize a csv processing helper"""
-        self.infile = infile
-        self.proc_num = proc_num
-        self.results_queue = results_queue
-        self.function = function
-        super().__init__()
-
-    def run(self):
-        """Apply transformation to a slice (which is just a smaller csv)"""
-        with tempfile.NamedTemporaryFile(delete=False, mode="w+") as outfile:
-            process_one_file(self.infile, outfile, self.function)
-        self.results_queue.put((self.proc_num, outfile.name))
+def apply_function_to_piece(args):
+    idx, function, piece = args
+    with open(piece) as infile_fh:
+        reader = csv.DictReader(infile_fh)
+        with tempfile.NamedTemporaryFile(delete=False, mode="w+") as outfile_fh:
+            fake_row = {fieldname: 0 for fieldname in reader.fieldnames}
+            function(fake_row)
+            outkeys = fake_row.keys()
+            sorted_outkeys = [x for x in reader.fieldnames if x in outkeys] # fields from input csv
+            sorted_outkeys += [x for x in outkeys if x not in reader.fieldnames] # new fields in output csv
+            writer = csv.DictWriter(outfile_fh, sorted_outkeys)
+            writer.writeheader()
+            for row in reader:
+                function(row) # apply the transformation to the row
+                writer.writerow(row) # write the output row
+    return idx, outfile_fh.name
 
 
 def merge(outfilename, rlist):
@@ -103,21 +88,15 @@ def process_csv(*, infilename=None, outfilename=None, function=identity, max_pro
 
     files = split(infilename)
 
-    logger.info("Applying %s to all %d pieces...", function.__name__, len(files))
-    # then process the pieces
-    processes = []
-    results = multiprocessing.Queue()
-    for proc_num, ifile in enumerate(files):
-        this_process = CSVProcessor(ifile, proc_num, results, function)
-        processes.append(this_process)
-        this_process.start()  # start the processes
+    print(files)
+    return
 
-    logger.info("Collecting the results...")
-    # get the bits back
     rlist = []
-    for process in processes:
-        process.join()  # wait to finish
-        rlist.append(results.get())  # get the path to the resulting piece
+    logger.info("Applying %s to all %d pieces...", function.__name__, len(files))
+    with multiprocessing.Pool(processes=max_procs) as wp:
+        for res in wp.imap_unordered(apply_function_to_piece, [(idx, function, ifile) for idx, ifile in enumerate(files)]):
+            rlist.append(res)
+
     rlist.sort()  # sort so that things are in the same order
 
     merge(outfilename, [x[1] for x in rlist])  # finally merge it all back together
